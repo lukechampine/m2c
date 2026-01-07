@@ -1554,12 +1554,100 @@ class StructAccess(Expression):
                 if field_path is not None:
                     self.assert_valid_field_path(field_path)
                     self.field_path = field_path
+
+                    # Check if field is void* BEFORE unification (unification may
+                    # change the type based on how the field is accessed)
+                    field_is_void_ptr = False
+                    if (
+                        ptr_struct is not None
+                        and ptr_struct.tag_name is not None
+                        and len(field_path) >= 2
+                        and isinstance(field_path[-1], str)
+                        and self.stack_info is not None
+                    ):
+                        field_type_data = field_type.data()
+                        if (
+                            field_type_data.ptr_to is not None
+                            and field_type_data.ptr_to.is_void()
+                        ):
+                            field_is_void_ptr = True
+
                     self.type.unify(field_type)
+
+                    # Apply void-field-type override AFTER unification
+                    # We must do this after unify because unify sets uf_parent
+                    if field_is_void_ptr:
+                        apply_void_field_type_override(
+                            ptr_struct.tag_name,
+                            field_path[-1],
+                            self.type,
+                            self.stack_info.global_info,
+                        )
 
                 self.checked_late_field_path = True
                 self.last_checked_kind = var_data.kind
                 self.last_checked_struct = ptr_struct
+
+        # Apply void-field-type override if field_path is set and type is void*
+        # This handles both freshly computed field_path and pre-existing field_path
+        if (
+            self.field_path is not None
+            and len(self.field_path) >= 2
+            and isinstance(self.field_path[-1], str)
+            and self.stack_info is not None
+        ):
+            type_data = self.type.data()
+            if type_data.ptr_to is not None and type_data.ptr_to.is_void():
+                # Get the struct from the base expression
+                var = late_unwrap(self.struct_var)
+                var_data = var.type.data()
+                if var_data.ptr_to is not None:
+                    ptr_target = var_data.ptr_to.data()
+                    if ptr_target.struct is not None and ptr_target.struct.tag_name is not None:
+                        field_name = self.field_path[-1]
+                        apply_void_field_type_override(
+                            ptr_target.struct.tag_name,
+                            field_name,
+                            self.type,
+                            self.stack_info.global_info,
+                        )
+
         return self.field_path
+
+    def has_void_field_type_override(self) -> bool:
+        """Check if this StructAccess has a void-field-type override.
+
+        This is used by EvalOnceExpr to decide whether to force a variable
+        instead of inlining the expression.
+        """
+        if self.stack_info is None:
+            return False
+
+        # Early exit if no overrides are configured
+        overrides = self.stack_info.global_info.typepool.void_field_type_overrides
+        if not overrides:
+            return False
+
+        # Ensure field_path is computed
+        field_path = self.late_field_path()
+        if field_path is None or len(field_path) < 2:
+            return False
+        if not isinstance(field_path[-1], str):
+            return False
+
+        # Get the struct from the base expression
+        var = late_unwrap(self.struct_var)
+        var_data = var.type.data()
+        if var_data.ptr_to is None:
+            return False
+
+        ptr_target = var_data.ptr_to.data()
+        if ptr_target.struct is None or ptr_target.struct.tag_name is None:
+            return False
+
+        # Check if there's an override for this struct.field
+        override_key = (ptr_target.struct.tag_name, field_path[-1])
+        return override_key in overrides
 
     def late_has_known_type(self) -> bool:
         if self.late_field_path() is not None:
@@ -1613,8 +1701,8 @@ class StructAccess(Expression):
         # Rewrite `x->unk0` to `*x` and `x.unk0` to `x`, unless has_nonzero_access
         if self.offset == 0 and not has_nonzero_access:
             return f"{'*' if deref else ''}{var.format(fmt)}"
-
-        return f"{parenthesize_for_struct_access(var, fmt)}{field_name}"
+        else:
+            return f"{parenthesize_for_struct_access(var, fmt)}{field_name}"
 
 
 @dataclass(frozen=True, eq=True)
@@ -2107,6 +2195,15 @@ class EvalOnceStmt(Statement):
     expr: EvalOnceExpr
 
     def should_write(self) -> bool:
+        # Check if this EvalOnceExpr wraps a StructAccess with a void-field-type override.
+        # If so, force it to emit as a variable.
+        if (
+            not self.expr.var.is_emitted
+            and isinstance(self.expr.wrapped_expr, StructAccess)
+            and self.expr.wrapped_expr.has_void_field_type_override()
+        ):
+            self.expr.force()
+
         if self.expr.emit_exactly_once and not self.expr.is_used:
             return True
         if not self.expr.var.is_emitted:
@@ -4598,6 +4695,23 @@ def apply_void_var_type_override(
         )
         if override_type is not None:
             var_type.data().uf_parent = override_type.data()
+
+
+def apply_void_field_type_override(
+    struct_name: str, field_name: str, field_type: Type, global_info: GlobalInfo
+) -> Optional[Type]:
+    """Apply a --void-field-type override to a struct field if one is specified.
+    Returns the override type if applied, None otherwise."""
+    override_key = (struct_name, field_name)
+    override_type_str = global_info.typepool.void_field_type_overrides.get(override_key)
+    if override_type_str is not None:
+        override_type = global_info.typepool.parse_type_string(
+            override_type_str, global_info.typemap
+        )
+        if override_type is not None:
+            field_type.data().uf_parent = override_type.data()
+            return override_type
+    return None
 
 
 def setup_reg_vars(stack_info: StackInfo, options: Options) -> None:

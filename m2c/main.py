@@ -4,7 +4,7 @@ import gc
 import sys
 import traceback
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from .c_types import build_typemap, dump_typemap
 from .error import DecompFailure
@@ -135,6 +135,7 @@ def run(options: Options) -> int:
         unk_inference=options.unk_inference,
         union_field_overrides=options.union_field_overrides,
         void_var_type_overrides=options.void_var_type_overrides,
+        void_field_type_overrides=options.void_field_type_overrides,
     )
     global_info = GlobalInfo(
         asm_data,
@@ -633,6 +634,17 @@ def parse_flags(flags: List[str]) -> Options:
         "The pointer * is implicit; use ** for double pointers. "
         "Can be specified multiple times for different variables.",
     )
+    group.add_argument(
+        "--void-field-type",
+        metavar="STRUCT.FIELD:TYPE",
+        dest="void_field_types",
+        action="append",
+        default=[],
+        help="Specify the type for a void* struct field. "
+        "Format: STRUCT_NAME.FIELD_NAME:TYPE_NAME (e.g., MyStruct.data:s32). "
+        "The pointer * is implicit; use ** for double pointers. "
+        "Can be specified multiple times for different fields.",
+    )
 
     args = parser.parse_args(flags)
     reg_vars = args.reg_vars.split(",") if args.reg_vars else []
@@ -691,6 +703,34 @@ def parse_flags(flags: List[str]) -> Options:
             type_name = type_name + "*"
         void_var_type_overrides[var_name] = type_name
 
+    # Parse void field type overrides
+    void_field_type_overrides: Dict[Tuple[str, str], str] = {}
+    for override in args.void_field_types:
+        # Split on last colon (type might contain colons for namespaces)
+        parts = override.rsplit(":", 1)
+        if len(parts) != 2:
+            print(
+                f"Error: Invalid void field type override '{override}'. "
+                "Expected format: STRUCT_NAME.FIELD_NAME:TYPE_NAME",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        struct_field, type_name = parts
+        # Split struct.field on first dot
+        sf_parts = struct_field.split(".", 1)
+        if len(sf_parts) != 2:
+            print(
+                f"Error: Invalid void field type override '{override}'. "
+                "Expected format: STRUCT_NAME.FIELD_NAME:TYPE_NAME",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        struct_name, field_name = sf_parts
+        # Add implicit * if not already present
+        if not type_name.endswith("*"):
+            type_name = type_name + "*"
+        void_field_type_overrides[(struct_name, field_name)] = type_name
+
     # The debug output interferes with the visualize output
     if args.visualize_flowgraph is not None:
         args.debug = False
@@ -736,6 +776,7 @@ def parse_flags(flags: List[str]) -> Options:
         disable_gc=args.disable_gc,
         union_field_overrides=union_field_overrides,
         void_var_type_overrides=void_var_type_overrides,
+        void_field_type_overrides=void_field_type_overrides,
     )
 
 

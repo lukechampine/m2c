@@ -45,6 +45,7 @@ class TypePool:
     warnings: List[str] = field(default_factory=list)
     union_field_overrides: Dict[str, str] = field(default_factory=dict)
     void_var_type_overrides: Dict[str, str] = field(default_factory=dict)
+    void_field_type_overrides: Dict[Tuple[str, str], str] = field(default_factory=dict)
 
     def parse_type_string(
         self, type_str: str, typemap: Optional[TypeMap]

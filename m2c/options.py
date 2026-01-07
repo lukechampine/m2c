@@ -3,7 +3,7 @@ import contextlib
 from dataclasses import dataclass
 import enum
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Union
+from typing import Dict, Iterator, List, Optional, Tuple, Union
 
 from .error import static_assert_unreachable
 
@@ -181,6 +181,7 @@ class Options:
     disable_gc: bool
     union_field_overrides: Dict[str, str]
     void_var_type_overrides: Dict[str, str]
+    void_field_type_overrides: Dict[Tuple[str, str], str]
 
     def formatter(self) -> Formatter:
         return Formatter(
