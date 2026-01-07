@@ -2274,6 +2274,385 @@ class CommentStmt(Statement):
         return f"// {self.contents}"
 
 
+@dataclass
+class StructCopyStmt(Statement):
+    """
+    Represents a whole-struct copy: *dest = *src or dest = src.
+    This is generated when we detect that all fields of a struct are being
+    copied from one location to another.
+    """
+
+    dest: Expression  # The destination struct (pointer or value)
+    source: Expression  # The source struct (pointer or value)
+    dest_is_pointer: bool  # True if dest is a pointer (emit *dest = ...)
+    source_is_pointer: bool  # True if source is a pointer (emit ... = *src)
+
+    def should_write(self) -> bool:
+        return True
+
+    def format(self, fmt: Formatter) -> str:
+        dest_str = format_expr(self.dest, fmt)
+        source_str = format_expr(self.source, fmt)
+        dest_prefix = "*" if self.dest_is_pointer else ""
+        source_prefix = "*" if self.source_is_pointer else ""
+        return f"{dest_prefix}{dest_str} = {source_prefix}{source_str};"
+
+
+@dataclass
+class StructFieldAccess:
+    """Information about a struct field access like `ptr->field` or `ptr->nested.field`."""
+
+    struct_access: "StructAccess"  # The original StructAccess expression
+    base: Expression  # The base struct pointer (e.g. `ptr` in `ptr->x`)
+    struct_decl: "StructDeclaration"  # The outermost struct type being accessed
+    field_name: str  # Just the final field name (e.g. "x" in `ptr->nested.x`)
+    parent_path: "AccessPath"  # Path without final field: [0] or [0, "nested"]
+
+
+@dataclass
+class FieldCopy:
+    """A single field copy: dest->field = source->field."""
+
+    dest: StructFieldAccess
+    source: StructFieldAccess
+    stmt: "StoreStmt"
+
+
+def _unwrap_casts(expr: Expression) -> Expression:
+    """Recursively unwrap Cast expressions to get the underlying value."""
+    uw = late_unwrap(expr)
+    if isinstance(uw, Cast):
+        return _unwrap_casts(uw.expr)
+    return uw
+
+
+def try_extract_field_access(
+    expr: Expression, *, unwrap_casts: bool = False
+) -> Optional[StructFieldAccess]:
+    """
+    Extract struct field access information from an expression.
+    Returns StructFieldAccess if expr is a valid struct field access, None otherwise.
+    """
+    uw = _unwrap_casts(expr) if unwrap_casts else late_unwrap(expr)
+    uw = late_unwrap(uw)
+    if not isinstance(uw, StructAccess):
+        return None
+
+    struct_var = late_unwrap(uw.struct_var)
+    var_data = struct_var.type.data()
+
+    # Get the struct declaration from the pointer target
+    struct_decl: Optional[StructDeclaration] = None
+    if var_data.ptr_to is not None:
+        ptr_target = var_data.ptr_to.data()
+        struct_decl = ptr_target.struct
+
+    if struct_decl is None:
+        return None
+
+    # Get field path (use already-computed path to avoid side effects)
+    field_path = uw.field_path
+    if field_path is None or len(field_path) < 2:
+        return None
+
+    # Last element must be a field name (string)
+    if not isinstance(field_path[-1], str):
+        return None
+
+    field_name = field_path[-1]
+    parent_path = field_path[:-1]
+
+    return StructFieldAccess(
+        struct_access=uw,
+        base=struct_var,
+        struct_decl=struct_decl,
+        field_name=field_name,
+        parent_path=parent_path,
+    )
+
+
+def _get_nested_struct_from_path(
+    base_struct: "StructDeclaration", path: "AccessPath"
+) -> Optional[Tuple["StructDeclaration", int]]:
+    """
+    Traverse the struct hierarchy following a field path to find the nested struct.
+
+    Given a path like [0, 'nested', 'inner', 'x'], this traverses:
+    - base_struct -> field 'nested' -> field 'inner'
+    and returns the struct at 'inner' along with its absolute offset from base_struct.
+
+    Returns (nested_struct, base_offset) or None if traversal fails.
+    """
+    if not path or len(path) < 2:
+        return None
+
+    # Skip the initial index (usually 0 for pointer dereference)
+    if not isinstance(path[0], int):
+        return None
+    path_elements = list(path[1:])
+
+    current_struct = base_struct
+    current_offset = 0
+
+    # Traverse all but the last element (which is the field being accessed)
+    for element in path_elements[:-1]:
+        if not isinstance(element, str):
+            return None
+
+        # Find this field in the current struct
+        field_found = None
+        for f in current_struct.fields:
+            if f.name == element:
+                field_found = f
+                break
+
+        if field_found is None:
+            return None
+
+        current_offset += field_found.offset
+
+        # Get the struct declaration for this field's type
+        field_data = field_found.type.data()
+        if field_data.struct is not None:
+            current_struct = field_data.struct
+        elif field_data.ptr_to is not None:
+            ptr_data = field_data.ptr_to.data()
+            if ptr_data.struct is not None:
+                current_struct = ptr_data.struct
+            else:
+                return None
+        else:
+            return None
+
+    return (current_struct, current_offset)
+
+
+def _find_target_struct(
+    copies: List[FieldCopy],
+) -> Optional[Tuple["StructDeclaration", int]]:
+    """
+    Find the struct being copied based on the destination field paths.
+    Returns (target_struct, base_offset) or None if copies don't form a valid group.
+    """
+    if not copies:
+        return None
+
+    first = copies[0]
+    dest_struct = first.dest.struct_decl
+    dest_path = first.dest.struct_access.field_path
+
+    if dest_path is None:
+        return None
+
+    # For direct struct copy (path like [0, "field"]), target is the dest struct itself
+    if len(first.dest.parent_path) == 1:
+        return (dest_struct, 0)
+
+    # For nested struct copy, traverse to find the nested struct
+    return _get_nested_struct_from_path(dest_struct, dest_path)
+
+
+def is_complete_struct_copy(
+    copies: List[FieldCopy], target_struct: "StructDeclaration", base_offset: int
+) -> bool:
+    """
+    Check if copies cover all fields of target_struct.
+    Also verifies that field names match between source and dest.
+    """
+    if target_struct.is_union:
+        return False
+    if target_struct.size is None or not target_struct.fields:
+        return False
+
+    # Compute field offsets that were copied (relative to target struct)
+    copied_offsets: Set[int] = set()
+    for copy in copies:
+        field_offset = copy.dest.struct_access.offset - base_offset
+        copied_offsets.add(field_offset)
+
+    # Check that all struct field offsets are covered
+    all_field_offsets = {f.offset for f in target_struct.fields}
+    if copied_offsets != all_field_offsets:
+        return False
+
+    # Verify field names match between source and dest
+    for copy in copies:
+        if copy.dest.field_name != copy.source.field_name:
+            return False
+
+    return True
+
+
+def build_struct_copy_stmt(
+    copies: List[FieldCopy], target_struct: "StructDeclaration", base_offset: int
+) -> StructCopyStmt:
+    """Build a StructCopyStmt from validated field copies."""
+    first = copies[0]
+    first_dest = first.dest.struct_access
+    first_source = first.source.struct_access
+
+    dest_is_pointer = len(first.dest.parent_path) == 1
+    source_is_pointer = len(first.source.parent_path) == 1
+
+    if dest_is_pointer:
+        # Direct destination: *dest = ...
+        dest_expr = first.dest.base
+    else:
+        # Nested destination: dest->nested = ...
+        assert target_struct.size is not None
+        dest_expr = StructAccess(
+            struct_var=first_dest.struct_var,
+            offset=base_offset,
+            target_size=target_struct.size,
+            field_path=first.dest.parent_path,
+            stack_info=first_dest.stack_info,
+            type=Type.ptr(Type.any()),
+        )
+
+    if source_is_pointer:
+        # Direct source: ... = *src
+        source_expr = first.source.base
+    else:
+        # Nested source: ... = src->nested (embedded struct, no deref)
+        assert target_struct.size is not None
+        first_field_offset = first.dest.struct_access.offset - base_offset
+        source_base_offset = first.source.struct_access.offset - first_field_offset
+        source_expr = StructAccess(
+            struct_var=first_source.struct_var,
+            offset=source_base_offset,
+            target_size=target_struct.size,
+            field_path=first.source.parent_path,
+            stack_info=first_source.stack_info,
+            type=Type.ptr(Type.any()),
+        )
+
+    return StructCopyStmt(
+        dest=dest_expr,
+        source=source_expr,
+        dest_is_pointer=dest_is_pointer,
+        source_is_pointer=source_is_pointer,
+    )
+
+
+def _can_extend_copy_group(
+    first: FieldCopy, stmt: Statement
+) -> Optional[FieldCopy]:
+    """
+    Check if stmt can extend a copy group started by first.
+    Returns a FieldCopy if compatible, None otherwise.
+    """
+    if not isinstance(stmt, StoreStmt) or not stmt.should_write():
+        return None
+
+    dest_access = try_extract_field_access(stmt.dest)
+    if dest_access is None:
+        return None
+
+    source_access = try_extract_field_access(stmt.source, unwrap_casts=True)
+    if source_access is None:
+        return None
+
+    # Must have same destination base pointer
+    if unwrap_deep(dest_access.base) != unwrap_deep(first.dest.base):
+        return None
+
+    # Must have same destination struct type
+    if dest_access.struct_decl is not first.dest.struct_decl:
+        return None
+
+    # Must have same source base pointer
+    if unwrap_deep(source_access.base) != unwrap_deep(first.source.base):
+        return None
+
+    # Must have same parent paths (same nested struct being copied)
+    if dest_access.parent_path != first.dest.parent_path:
+        return None
+    if source_access.parent_path != first.source.parent_path:
+        return None
+
+    return FieldCopy(dest=dest_access, source=source_access, stmt=stmt)
+
+
+def try_collect_struct_copy(
+    statements: List[Statement], start: int
+) -> Tuple[Optional[StructCopyStmt], int]:
+    """
+    Try to collect a complete struct copy starting at index `start`.
+    Returns (StructCopyStmt, count) on success, or (None, 0) on failure.
+    """
+    stmt = statements[start]
+    if not isinstance(stmt, StoreStmt) or not stmt.should_write():
+        return (None, 0)
+
+    dest_access = try_extract_field_access(stmt.dest)
+    if dest_access is None:
+        return (None, 0)
+
+    # Skip unions (fields overlap)
+    if dest_access.struct_decl.is_union:
+        return (None, 0)
+
+    source_access = try_extract_field_access(stmt.source, unwrap_casts=True)
+    if source_access is None:
+        return (None, 0)
+
+    # Start collecting copies
+    first_copy = FieldCopy(dest=dest_access, source=source_access, stmt=stmt)
+    copies: List[FieldCopy] = [first_copy]
+
+    # Try to extend with consecutive statements
+    j = start + 1
+    while j < len(statements):
+        next_copy = _can_extend_copy_group(first_copy, statements[j])
+        if next_copy is None:
+            break
+        copies.append(next_copy)
+        j += 1
+
+    # Need at least 2 copies to merge
+    if len(copies) < 2:
+        return (None, 0)
+
+    # Find target struct and check completeness
+    target_info = _find_target_struct(copies)
+    if target_info is None:
+        return (None, 0)
+
+    target_struct, base_offset = target_info
+
+    if not is_complete_struct_copy(copies, target_struct, base_offset):
+        return (None, 0)
+
+    # All fields copied - build the merged statement
+    merged = build_struct_copy_stmt(copies, target_struct, base_offset)
+    return (merged, len(copies))
+
+
+def merge_struct_copies(statements: List[Statement]) -> List[Statement]:
+    """
+    Detect and merge consecutive struct field copies into whole-struct copies.
+
+    Handles direct copies and nested copies on either side, e.g.:
+    1. dest->x = src->x; dest->y = src->y; -> *dest = *src;
+    2. dest->x = src->nested.x; dest->y = src->nested.y; -> *dest = src->nested;
+    3. dest->nested.x = src->x; dest->nested.y = src->y; -> dest->nested = *src;
+    """
+    if not statements:
+        return statements
+
+    result: List[Statement] = []
+    i = 0
+    while i < len(statements):
+        merged, consumed = try_collect_struct_copy(statements, i)
+        if merged is not None:
+            result.append(merged)
+            i += consumed
+        else:
+            result.append(statements[i])
+            i += 1
+    return result
+
+
 @dataclass(frozen=True)
 class AddressMode:
     offset: int
@@ -2477,7 +2856,8 @@ class BlockInfo:
         )
 
     def statements_to_write(self) -> List[Statement]:
-        return [st for st in self.to_write if st.should_write()]
+        statements = [st for st in self.to_write if st.should_write()]
+        return merge_struct_copies(statements)
 
 
 def get_block_info_for_block(block: Block) -> BlockInfo:
